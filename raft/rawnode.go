@@ -68,14 +68,35 @@ type Ready struct {
 
 // RawNode is a wrapper of Raft.
 type RawNode struct {
-	Raft *Raft
-	// Your Data Here (2A).
+	Raft               *Raft
+	// Mutable fields.
+	prevSoftSt     *SoftState
+	prevHardSt     pb.HardState
+	// stepsOnAdvance []pb.Message
+}
+
+func (a *SoftState) equal(b *SoftState) bool {
+	return a.Lead == b.Lead && a.RaftState == b.RaftState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
-	// Your Code Here (2A).
-	return nil, nil
+    r := newRaft(config) // 你自己的 Raft 构造函数
+	softstate := &SoftState{
+		Lead:      r.Lead,
+		RaftState: r.State,
+	}
+	hardstate := pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+    rn := &RawNode{
+        Raft:       r,
+		prevSoftSt: softstate,
+		prevHardSt: hardstate,
+    }
+    return rn, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -142,20 +163,129 @@ func (rn *RawNode) Step(m pb.Message) error {
 
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
-	// Your Code Here (2A).
-	return Ready{}
-}
+	rd := Ready{}
 
+	// 软状态（Leader ID、当前状态）变化
+	curSoftSt := &SoftState{
+		Lead:      rn.Raft.Lead,
+		RaftState: rn.Raft.State,
+	}
+	if !curSoftSt.equal(rn.prevSoftSt) {
+		rd.SoftState = curSoftSt
+	}
+
+	// 硬状态变化（Term/Vote/Commit）
+	curHardSt := pb.HardState{
+		Term:   rn.Raft.Term,
+		Vote:   rn.Raft.Vote,
+		Commit: rn.Raft.RaftLog.committed,
+	}
+	if !isHardStateEqual(curHardSt, rn.prevHardSt) {
+		rd.HardState = curHardSt
+	}
+
+	// Entries：新生成、但未持久化（stabled）日志
+	lastStabled := rn.Raft.RaftLog.stabled
+	lastIndex := rn.Raft.RaftLog.LastIndex()
+	if lastIndex > lastStabled {
+		ents, err := rn.Raft.RaftLog.Entries(lastStabled+1, lastIndex+1)
+		if err != nil {
+			panic(err) // 调试阶段可以 panic，生产中要处理错误
+		}
+		rd.Entries = ents
+	}
+
+	// CommittedEntries：已提交、但尚未 apply 的日志
+	commitIndex := rn.Raft.RaftLog.committed
+	appliedIndex := rn.Raft.RaftLog.applied
+	if commitIndex > appliedIndex {
+		ents, err := rn.Raft.RaftLog.Entries(appliedIndex+1, commitIndex+1)
+		if err != nil {
+			panic(err)
+		}
+		rd.CommittedEntries = ents
+	}
+
+	// Messages：等待发送的消息
+	rd.Messages = rn.Raft.msgs
+	// 清空消息缓存（等 Advance 调用后也可以清，但一般这里清）
+	rn.Raft.msgs = nil
+
+	return rd
+}
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
-	// Your Code Here (2A).
+	r := rn.Raft
+
+	// 当前软状态
+	currentSoftSt := &SoftState{
+		Lead:      r.Lead,
+		RaftState: r.State,
+	}
+
+	// 当前硬状态
+	currentHardSt := pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+
+	// 检查软状态是否变化
+	if !currentSoftSt.equal(rn.prevSoftSt) {
+		return true
+	}
+
+	// 检查硬状态是否变化
+	if !isHardStateEqual(currentHardSt, rn.prevHardSt) {
+		return true
+	}
+
+	// 检查是否有待持久化的日志条目
+	if len(r.RaftLog.entries) > 0 {
+		return true
+	}
+
+	// 检查是否有待提交但未应用的条目
+	if r.RaftLog.applied < r.RaftLog.committed {
+		return true
+	}
+
+	// 检查是否有待发送消息
+	if len(r.msgs) > 0 {
+		return true
+	}
+
+	// 都没有，返回 false
 	return false
 }
 
 // Advance notifies the RawNode that the application has applied and saved progress in the
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
-	// Your Code Here (2A).
+	// 更新 prevSoftState 和 prevHardState
+	if rd.SoftState != nil {
+		rn.prevSoftSt = rd.SoftState
+	}
+	if !isHardStateEqual(rd.HardState, pb.HardState{}) {
+		rn.prevHardSt = rd.HardState
+	}
+
+	// 丢弃已经保存到稳定存储的 entries
+	if len(rd.Entries) > 0 {
+		last := rd.Entries[len(rd.Entries)-1].Index
+		rn.Raft.RaftLog.stabled = last
+	}
+
+	// 更新已经提交并应用的 entries（CommittedEntries）
+	if len(rd.CommittedEntries) > 0 {
+		last := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+		rn.Raft.RaftLog.applied = last
+	}
+
+	// 快照已处理（如果有）
+	// if !isEmptySnap(rd.Snapshot) {
+	// 	rn.Raft.RaftLog.pendingSnapshot = nil
+	// }
 }
 
 // GetProgress return the Progress of this node and its peers, if this

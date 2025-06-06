@@ -33,6 +33,8 @@ func Test(t *testing.T) {
 	TestingT(t)
 }
 
+
+
 var _ = Suite(&testLogSuite{})
 
 type testLogSuite struct {
