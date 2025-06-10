@@ -163,7 +163,9 @@ func (rn *RawNode) Step(m pb.Message) error {
 
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
-	rd := Ready{}
+	rd := Ready{
+		Entries: 		rn.Raft.RaftLog.unstableEntries(),
+	}
 
 	// 软状态（Leader ID、当前状态）变化
 	curSoftSt := &SoftState{
@@ -173,26 +175,14 @@ func (rn *RawNode) Ready() Ready {
 	if !curSoftSt.equal(rn.prevSoftSt) {
 		rd.SoftState = curSoftSt
 	}
-
 	// 硬状态变化（Term/Vote/Commit）
 	curHardSt := pb.HardState{
 		Term:   rn.Raft.Term,
 		Vote:   rn.Raft.Vote,
 		Commit: rn.Raft.RaftLog.committed,
 	}
-	if !isHardStateEqual(curHardSt, rn.prevHardSt) {
-		rd.HardState = curHardSt
-	}
-
-	// Entries：新生成、但未持久化（stabled）日志
-	lastStabled := rn.Raft.RaftLog.stabled
-	lastIndex := rn.Raft.RaftLog.LastIndex()
-	if lastIndex > lastStabled {
-		ents, err := rn.Raft.RaftLog.Entries(lastStabled+1, lastIndex+1)
-		if err != nil {
-			panic(err) // 调试阶段可以 panic，生产中要处理错误
-		}
-		rd.Entries = ents
+	if !isHardStateEqual(curHardSt, rn.prevHardSt) && !isHardStateEmpty(curHardSt) {
+    	rd.HardState = curHardSt
 	}
 
 	// CommittedEntries：已提交、但尚未 apply 的日志
@@ -205,14 +195,20 @@ func (rn *RawNode) Ready() Ready {
 		}
 		rd.CommittedEntries = ents
 	}
-
-	// Messages：等待发送的消息
-	rd.Messages = rn.Raft.msgs
-	// 清空消息缓存（等 Advance 调用后也可以清，但一般这里清）
+	if len(rn.Raft.msgs) == 0 {
+		rd.Messages = nil
+	} else {
+		rd.Messages = rn.Raft.msgs
+	}
+	// 清空消息缓存
 	rn.Raft.msgs = nil
-
 	return rd
 }
+
+func isHardStateEmpty(st pb.HardState) bool {
+    return st.Term == 0 && st.Vote == 0 && st.Commit == 0
+}
+
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	r := rn.Raft
@@ -236,12 +232,12 @@ func (rn *RawNode) HasReady() bool {
 	}
 
 	// 检查硬状态是否变化
-	if !isHardStateEqual(currentHardSt, rn.prevHardSt) {
+	if !isHardStateEqual(currentHardSt, rn.prevHardSt) && !isHardStateEmpty(currentHardSt) {
 		return true
 	}
 
 	// 检查是否有待持久化的日志条目
-	if len(r.RaftLog.entries) > 0 {
+	if len(r.RaftLog.unstableEntries()) > 0 {
 		return true
 	}
 
@@ -266,8 +262,9 @@ func (rn *RawNode) Advance(rd Ready) {
 	if rd.SoftState != nil {
 		rn.prevSoftSt = rd.SoftState
 	}
-	if !isHardStateEqual(rd.HardState, pb.HardState{}) {
-		rn.prevHardSt = rd.HardState
+
+	if !isHardStateEqual(rd.HardState, rn.prevHardSt) && !isHardStateEmpty(rd.HardState) {
+    	rn.prevHardSt = rd.HardState
 	}
 
 	// 丢弃已经保存到稳定存储的 entries
@@ -279,7 +276,7 @@ func (rn *RawNode) Advance(rd Ready) {
 	// 更新已经提交并应用的 entries（CommittedEntries）
 	if len(rd.CommittedEntries) > 0 {
 		last := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
-		rn.Raft.RaftLog.applied = last
+		rn.Raft.RaftLog.appliedTo(last)
 	}
 
 	// 快照已处理（如果有）

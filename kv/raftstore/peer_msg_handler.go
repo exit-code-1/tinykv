@@ -42,6 +42,20 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
+	if d.RaftGroup.HasReady() {
+    ready := d.RaftGroup.Ready()
+    // ....
+    d.peerStorage.SaveReadyState(&ready)
+    // ...
+    d.Send(d.ctx.trans, ready.Messages)
+
+    // ...
+    if len(ready.CommittedEntries) > 0 {
+      // applyEntries(.....)
+    }
+
+    d.RaftGroup.Advance(ready)
+  	}
 	// Your Code Here (2B).
 }
 

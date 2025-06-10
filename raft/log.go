@@ -54,10 +54,6 @@ type RaftLog struct {
 	// (Used in 2C)
 	pendingSnapshot *pb.Snapshot
 
-	// Your Data Here (2A).
-	firstIndex uint64
-	
-	lastIndex uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -89,8 +85,6 @@ func newLog(storage Storage) *RaftLog {
 		applied:          firstIndex - 1,
 		stabled:          lastIndex,
 		pendingSnapshot:  nil,
-		firstIndex: 	firstIndex,
-		lastIndex: 		lastIndex,
 	}
 }
 
@@ -191,41 +185,47 @@ func (l *RaftLog) allEntries() []pb.Entry {
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-	if len(l.entries) == 0 {
-		return nil
-	}
-	if l.stabled < l.firstIndex-1 {
-		// 全部都没稳定，返回全部
-		return l.allEntries()
-	}
-	// 只返回 index > stabled 的部分
-	return append([]pb.Entry{}, l.entries[l.stabled-l.firstIndex+1:]...)
+    if len(l.entries) == 0 {
+        return []pb.Entry{}
+    }
+    firstIndex := l.FirstIndex()
+    if l.stabled < firstIndex-1 {
+        return append([]pb.Entry{}, l.entries...)
+    }
+    start := l.stabled - firstIndex + 1
+    if start >= uint64(len(l.entries)) {
+        return []pb.Entry{}
+    }
+    return append([]pb.Entry{}, l.entries[start:]...)
 }
-
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() []pb.Entry {
+	firstIndex := l.FirstIndex()
 	if l.applied < l.committed {
-		return l.entries[l.applied+1-l.firstIndex : l.committed+1-l.firstIndex]
+		return l.entries[l.applied+1-firstIndex : l.committed+1-firstIndex]
 	}
 	return nil
 }
 
 func (l *RaftLog) FirstIndex() uint64 {
-	return l.firstIndex
+	// 如果有 pendingSnapshot，firstIndex 是快照最后一条日志的索引+1
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot.Metadata.Index + 1
+	}
+	if len(l.entries) > 0 {
+		return l.entries[0].Index
+	}
+	// 如果没有日志和快照，返回1或0视实现
+	return 1
 }
 
-func (l *RaftLog) SetLastIndex(index uint64) {
-	// Your Code Here (2A).
-	if index < l.firstIndex {
-		log.Panicf("SetLastIndex: index %d is less than firstIndex %d", index, l.firstIndex)
-	}
-	l.lastIndex = index
-}
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
-	// Your Code Here (2A).
-	return l.lastIndex
+	if len(l.entries) == 0 {
+        return l.FirstIndex() - 1
+    }
+    return l.entries[0].Index + uint64(len(l.entries)) - 1
 }
 
 // Term return the term of the entry in the given index

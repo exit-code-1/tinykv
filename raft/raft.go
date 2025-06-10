@@ -172,13 +172,14 @@ func newRaft(c *Config) *Raft {
 		panic(err)
 	}
 	raftLog := newLog(c.Storage)
+	lastIndex := raftLog.LastIndex()
 
 	prs := make(map[uint64]*Progress)
 	if len(c.peers) > 0 {
 		for _, id := range c.peers {
 			prs[id] = &Progress{
 				Match: 0,
-				Next: raftLog.lastIndex + 1,
+				Next: lastIndex + 1,
 			}
 		}
 	} else {
@@ -203,7 +204,6 @@ func newRaft(c *Config) *Raft {
 		leadTransferee:   None,
 		PendingConfIndex: 0,
 	}
-	r.becomeFollower(r.Term, None)
 	if c.Applied > 0 {
 		r.RaftLog.appliedTo(c.Applied)
 	}
@@ -378,35 +378,38 @@ func (r *Raft) becomeLeader() {
 	r.heartbeatElapsed = 0
 	r.leadTransferee = 0
 	
-	lastIndex := r.RaftLog.LastIndex()
-	for id := range r.Prs {
-		if id == r.id {
-			r.updateProgress(id, lastIndex, lastIndex+1) // ✅ Leader 本人
-		} else {
-			r.updateProgress(id, 0, lastIndex+1)         // 其他节点初始化
-		}
-	}
 	// Leader should propose a noop entry
 	entry := pb.Entry{
+		Term: r.Term,
 		EntryType: pb.EntryType_EntryNormal,
 	}
 	r.appendEntry(&entry)
+	
+	lastIndex := r.RaftLog.LastIndex()
+	for id := range r.Prs {
+		if id == r.id {
+			r.updateProgress(id, lastIndex, lastIndex+1)
+		} else {
+			r.updateProgress(id, 0, lastIndex)
+		}
+	}
 	// 广播 AppendEntries 消息给所有 followers
 	if !r.brocAppend() {
 		panic("failed to broadcast append entries")
 	}
 	r.PendingConfIndex = r.RaftLog.LastIndex() // 设置 PendingConfIndex 为当前日志的最后索引
+	if len(r.Prs) == 1 {
+		r.maybeCommit()
+	}
 }
 
 func (r *Raft) appendEntry(entries ...*pb.Entry) {
 	lastIndex := r.RaftLog.LastIndex()
 	for _, ent := range entries {
-		ent.Term = r.Term
 		ent.Index = lastIndex + 1
 		lastIndex++
 		r.RaftLog.entries = append(r.RaftLog.entries, *ent)
 	}
-	r.RaftLog.SetLastIndex(lastIndex)
 }
 
 func (r *Raft) append_or_rewriteEntry(prevLogIndex uint64, entries []*pb.Entry) {
@@ -422,17 +425,19 @@ func (r *Raft) append_or_rewriteEntry(prevLogIndex uint64, entries []*pb.Entry) 
             if localTerm != entry.Term {
                 // 冲突：删除本地日志从冲突开始的所有条目
                 log.entries = log.entries[:localIndex - log.entries[0].Index]
+				if log.stabled >= localIndex {
+                    log.stabled = localIndex - 1
+                }
                 // 追加后续新日志条目
-				for _, e := range entries[i:] {
-					log.entries = append(log.entries, *e)
-				}
+				r.appendEntry(entries[i:]...)
 				return
             }
         } else {
-            // 本地日志没有这条日志，直接追加
-			for _, e := range entries[i:] {
-				log.entries = append(log.entries, *e)
+			if log.stabled >= localIndex {
+				log.stabled = localIndex - 1
 			}
+            // 本地日志没有这条日志，直接追加
+			r.appendEntry(entries[i:]...)
             return
         }
     }
@@ -489,14 +494,13 @@ func (r *Raft) HandlePropose(m pb.Message) {
     if r.State != StateLeader {
         return
     }
+	if m.Term < r.Term {
+		for _, ent := range m.Entries {
+			ent.Term = r.Term 
+		}
+	}
+	r.appendEntry(m.Entries...)
 	lastIndex := r.RaftLog.LastIndex()
-    for _, e := range m.Entries {
-        e.Term = r.Term
-        e.Index = lastIndex + 1
-		lastIndex++
-        r.RaftLog.entries = append(r.RaftLog.entries, *e)
-    }
-	r.RaftLog.SetLastIndex(lastIndex)
 	r.updateProgress(r.id, lastIndex, lastIndex+1) // 更新自己的进度
     if !r.brocAppend() { // 确认方法名拼写
         panic(ErrProposalDropped)
@@ -525,11 +529,6 @@ func (r *Raft) Step(m pb.Message) error {
 	})
 		return nil
 	}
-	// 2. 如果消息 term > 当前 term，则更新 term 并变为 follower
-	if m.Term > r.Term {
-		r.becomeFollower(m.Term, m.From)
-	}
-
 	// 3. 分类型处理
 	switch m.MsgType {
 
@@ -621,33 +620,46 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 }
 
 func (r *Raft) handleVoteResp(m pb.Message) {
-	// 如果收到的投票响应的任期小于当前任期，忽略
-	if m.Term < r.Term {
-		return
-	}
+    // 如果收到的响应任期大于当前任期，降级成Follower，停止选举
+    if m.Term > r.Term {
+        r.becomeFollower(m.Term, None)
+        return
+    }
 
-	// 如果收到的投票响应的任期大于当前任期，更新当前任期并转换为Follower状态
-	if m.Term > r.Term {
-		r.becomeFollower(m.Term, None)
-		return
-	}
+    // 任期小于当前任期，或者当前不是candidate状态，则忽略
+    if m.Term < r.Term || r.State != StateCandidate {
+        return
+    }
 
-	// 如果是投票响应且是同意的，则记录投票
-	if !m.Reject {
-		r.votes[m.From] = true
-	}
+    // 更新投票记录，true表示同意，false表示拒绝
+    r.votes[m.From] = !m.Reject
 
-	// 检查是否获得了大多数节点的投票
-	voteCount := 0
-	for _, voted := range r.votes {
-		if voted {
-			voteCount++
-		}
-	}
-	if voteCount > len(r.Prs)/2 {
-		r.becomeLeader()
-	}
+    // 重新统计同意票和拒绝票数量
+    voteCount := 0
+    denialCount := 0
+    for _, vote := range r.votes {
+        if vote {
+            voteCount++
+        } else {
+            denialCount++
+        }
+    }
+
+    quorum := len(r.Prs)/2
+
+    // 达到过半同意票，成为Leader
+    if voteCount > quorum {
+        r.becomeLeader()
+        return
+    }
+
+    // 达到过半拒绝票，选举失败，降级成Follower
+    if denialCount > quorum {
+        r.becomeFollower(r.Term, None)
+        return
+    }
 }
+
 
 
 // handleAppendEntries handle AppendEntries RPC request
@@ -718,9 +730,8 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 	// 5. 更新提交索引
 	if m.Commit > r.RaftLog.committed {
-		// 不能提交超过领导者的已提交索引和自己最后日志索引中较小的那个
-		lastIndex := r.RaftLog.LastIndex()
-		r.RaftLog.committed = min(m.Commit, lastIndex)
+		matchIndex := m.Index + uint64(len(m.Entries))
+		r.RaftLog.committed = min(m.Commit, matchIndex)
 	}
 
 	// 6. 发送成功响应，附带最新日志索引
@@ -757,11 +768,10 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
     r.Lead = m.From
 
     // follower 根据 leader 传来的 Commit 推进自己的 committed（但不能超过自己的 lastIndex）
-    if m.Commit > r.RaftLog.committed {
-        lastIndex := r.RaftLog.LastIndex()
-        r.RaftLog.committed = min(m.Commit, lastIndex)
-        // r.RaftLog.apply()
-    }
+	if m.Commit > r.RaftLog.committed {
+		matchIndex := m.Index + uint64(len(m.Entries))
+		r.RaftLog.committed = min(m.Commit, matchIndex)
+	}
     r.send(pb.Message{
         MsgType: pb.MessageType_MsgHeartbeatResponse,
         To:      m.From,
@@ -773,27 +783,13 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 
 
 func (r *Raft) handleHeartbeatResp(m pb.Message) {
-    if m.Term > r.Term {
-        r.becomeFollower(m.Term, None)
-        return
-    }
-    if r.State != StateLeader || m.Term < r.Term {
-        // 忽略过时或者非Leader状态的回复
-        return
-    }
-
-    pr, ok := r.Prs[m.From]
-    if !ok {
-        // 不属于集群成员
-        return
-    }
-    if pr.Match < r.RaftLog.committed {
-        pr.Match = r.RaftLog.committed
-    }
-    pr.Next = pr.Match + 1
-
-    // 尝试推进 leader 已提交索引
-    // r.maybeCommit()
+  if m.Term > r.Term {
+    r.becomeFollower(m.Term, None)
+    return
+  }
+  if m.Commit < r.RaftLog.committed || r.Prs[m.From].Match < r.RaftLog.LastIndex() {
+    r.sendAppend(m.From)
+  }
 }
 
 func (r *Raft) handleAppendResponse(m pb.Message) {
@@ -837,6 +833,7 @@ func (r *Raft) maybeCommit() bool {
 	mci := r.RaftLog.maybeCommit(r.Prs, r.Term)
 	if mci > r.RaftLog.committed {
 		r.RaftLog.commitTo(mci)
+		r.brocAppend()
 		return true
 	}
 	return false
