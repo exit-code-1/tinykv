@@ -307,9 +307,42 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
-	// Your Code Here (2B).
-	return nil
+    // Step 1: 没有条目则直接返回
+    if len(entries) == 0 {
+        return nil
+    }
+
+    // Step 2: 获取当前将要持久化的最大 index
+    stableLast := entries[len(entries)-1].Index
+
+    // Step 3: 获取之前持久化的最大 index（也可以用 ps.raftState.LastIndex，但这里更保险）
+    prevLast, err := ps.LastIndex()
+    if err != nil {
+        return err
+    }
+
+    // Step 4: 更新 raftState 的 LastIndex 和 LastTerm
+    ps.raftState.LastIndex = stableLast
+    ps.raftState.LastTerm = entries[len(entries)-1].Term
+
+    // Step 5: 追加新的日志条目
+    for _, ent := range entries {
+        key:= meta.RaftLogKey(ps.region.Id, ent.Index)
+        if err != nil {
+            return err
+        }
+        raftWB.SetMeta(key, &ent)
+    }
+
+    // Step 6: 删除被截断的日志（这些日志永远不会被提交）
+    for i := stableLast + 1; i <= prevLast; i++ {
+        key := meta.RaftLogKey(ps.region.Id, i)
+        raftWB.DeleteMeta(key)
+    }
+
+    return nil
 }
+
 
 // Apply the peer with given snapshot
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
@@ -331,6 +364,17 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
+	// 1. append
+	wb := &engine_util.WriteBatch{}
+	ps.Append(ready.Entries, wb)
+	// 2. update hardstate and save raftState
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+	}
+	wb.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	// 3. write to DB
+	ps.Engines.WriteRaft(wb)
+
 	return nil, nil
 }
 

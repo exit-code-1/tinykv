@@ -18,6 +18,7 @@ import (
 	"errors"
 	"math/rand"
 
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -245,6 +246,7 @@ func (r *Raft) brocAppend() bool {
 func (r *Raft) sendAppend(to uint64) bool {
 	pr, ok := r.Prs[to]
 	if !ok {
+		log.Infof("[sendAppend] Node %d not found in Peers", to)
 		return false
 	}
 
@@ -252,17 +254,11 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevIndex := nextIndex - 1
 	prevTerm, err := r.RaftLog.Term(prevIndex)
 	if err != nil {
-		// prevIndex 超出范围或日志丢失，说明需要先发快照（暂不处理）
-		return false
+		// panic
 	}
 
-	// 尝试从 nextIndex 获取日志条目。如果超出范围（即没有新日志），也继续发送“空日志”
-	entries, err := r.RaftLog.EntriesFrom(nextIndex)
-	if err != nil && err != ErrUnavailable {
-		return false
-	}
+	entries, _ := r.RaftLog.EntriesFrom(nextIndex)
 
-	// 构造 AppendEntries 消息，即使 entries 是空的也发送
 	m := pb.Message{
 		MsgType: pb.MessageType_MsgAppend,
 		To:      to,
@@ -289,17 +285,12 @@ func (r *Raft) sendHeartbeat() {
 		if id == r.id {
 			continue
 		}
-		pr := r.Prs[id]
-		prevIndex := pr.Next - 1
-		prevTerm, _ := r.RaftLog.Term(prevIndex)
 
 		m := pb.Message{
 			MsgType: pb.MessageType_MsgHeartbeat,
 			To:      id,
 			From:    r.id,
 			Term:    r.Term,
-			Index:   prevIndex,
-			LogTerm: prevTerm,
 			Commit:  r.RaftLog.committed,
 		}
 		r.send(m)
@@ -660,11 +651,59 @@ func (r *Raft) handleVoteResp(m pb.Message) {
     }
 }
 
+// checkLogMatching 检查 index/term 是否与本地日志匹配。
+// 返回 ok 表示是否匹配，冲突 term 和 index 可用于快速回退。
+func (r *Raft) checkLogMatching(index, term uint64) (bool, uint64, uint64) {
+	lastIndex := r.RaftLog.LastIndex()
+
+	// 日志太短，直接失败
+	if index > lastIndex {
+		return false, lastIndex + 1, 0
+	}
+
+	// 获取指定 index 的 term
+	localTerm, err := r.RaftLog.Term(index)
+	if err != nil {
+		// Term 读取失败视为不匹配
+		return false, index, 0
+	}
+
+	// term 不匹配，返回冲突信息
+	if localTerm != term {
+		conflictTerm := localTerm
+		conflictIndex := r.RaftLog.findFirstIndexOfTerm(conflictTerm)
+		return false, conflictIndex, conflictTerm
+	}
+
+	// 匹配成功
+	return true, 0, 0
+}
+
+func (l *RaftLog) findFirstIndexOfTerm(term uint64) uint64 {
+	first := l.FirstIndex()
+	for i := l.LastIndex(); i >= first; i-- {
+		t, err := l.Term(i)
+		if err != nil {
+			break
+		}
+		if t == term {
+			// 继续向前找
+		} else if t < term {
+			return i + 1
+		}
+	}
+	return first
+}
 
 
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
+	// log.Infof("[Node %d] <- MsgAppend from %d [term: %d, prevIndex: %d, prevTerm: %d, entries: %d, commit: %d]",
+	// 	r.id, m.From, m.Term, m.Index, m.LogTerm, len(m.Entries), m.Commit)
+
 	if m.Term < r.Term {
+		// log.Infof("[Node %d] Reject MsgAppend from %d: stale term %d < current %d",
+		// 	r.id, m.From, m.Term, r.Term)
 		r.send(pb.Message{
 			MsgType: pb.MessageType_MsgAppendResponse,
 			To:      m.From,
@@ -677,64 +716,54 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 
 	if m.Term > r.Term {
+		// log.Infof("[Node %d] BecomeFollower from %d with higher term %d > %d",
+		// 	r.id, m.From, m.Term, r.Term)
 		r.becomeFollower(m.Term, m.From)
 	}
 
 	if r.State == StateLeader {
+		// log.Infof("[Node %d] Ignore MsgAppend: I'm leader", r.id)
 		return
 	}
 
-	if r.State == StateCandidate{
-		// 如果是候选人，变为跟随者
+	if r.State == StateCandidate {
+		// log.Infof("[Node %d] Step down to follower due to MsgAppend from %d", r.id, m.From)
 		r.becomeFollower(m.Term, m.From)
 	}
 
 	r.electionElapsed = 0
 	r.Lead = m.From
 
-	// 3. 日志匹配检查：
-	prevIndex := m.Index
-	prevTerm := m.LogTerm
 
-	// 检查 prevIndex 是否在本地日志范围内
-	if prevIndex > r.RaftLog.LastIndex() {
-		// 本地日志太短，拒绝并回复最后日志索引
+	ok, conflictIndex, conflictTerm := r.checkLogMatching(m.Index, m.LogTerm)
+	if !ok {
 		r.send(pb.Message{
 			MsgType: pb.MessageType_MsgAppendResponse,
 			To:      m.From,
 			From:    r.id,
 			Term:    r.Term,
 			Reject:  true,
-			Index:   r.RaftLog.LastIndex(),
+			Index:   conflictIndex,
+			LogTerm: conflictTerm,
 		})
 		return
 	}
 
-	// 检查 prevIndex 处的日志项 term 是否匹配
-	localTerm, err := r.RaftLog.Term(prevIndex)
-	if err != nil || localTerm != prevTerm {
-		// 日志不匹配，拒绝并回复冲突的索引
-		r.send(pb.Message{
-			MsgType: pb.MessageType_MsgAppendResponse,
-			To:      m.From,
-			From:    r.id,
-			Term:    r.Term,
-			Reject:  true,
-			Index:   prevIndex - 1, // 通常回复冲突的前一个索引方便回退
-		})
-		return
-	}
 
-	// 4. 追加日志，覆盖冲突部分
-	r.append_or_rewriteEntry(prevIndex, m.Entries)
+	// log.Infof("[Node %d] Append %d entries starting from index %d",
+	// 	r.id, len(m.Entries), prevIndex+1)
+	r.append_or_rewriteEntry(m.Index, m.Entries)
 
-	// 5. 更新提交索引
 	if m.Commit > r.RaftLog.committed {
 		matchIndex := m.Index + uint64(len(m.Entries))
-		r.RaftLog.committed = min(m.Commit, matchIndex)
+		newCommit := min(m.Commit, matchIndex)
+		// log.Infof("[Node %d] Advance commit index from %d to %d",
+		// 	r.id, r.RaftLog.committed, newCommit)
+		r.RaftLog.committed = newCommit
 	}
 
-	// 6. 发送成功响应，附带最新日志索引
+	// log.Infof("[Node %d] Accept MsgAppend. Send success response with Index %d",
+	// 	r.id, r.RaftLog.LastIndex())
 	r.send(pb.Message{
 		MsgType: pb.MessageType_MsgAppendResponse,
 		To:      m.From,
@@ -744,6 +773,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		Index:   r.RaftLog.LastIndex(),
 	})
 }
+
 
 
 // handleHeartbeat handle Heartbeat RPC request
@@ -795,42 +825,42 @@ func (r *Raft) handleHeartbeatResp(m pb.Message) {
 func (r *Raft) handleAppendResponse(m pb.Message) {
     pr, ok := r.Prs[m.From]
     if !ok {
-        // 不属于集群成员的回复，忽略
+        // 来自非法节点，忽略
         return
     }
+	// log.Infof("[AppendResponse] from=%d reject=%v index=%d match=%d next=%d", m.From, m.Reject, m.Index, pr.Match, pr.Next)
 
     if m.Reject {
-        // follower 拒绝了，回退 nextIndex
-        // m.Index 是 follower 提示的回退位置
+        // Append 被拒绝，Leader 需要回退 nextIndex
+        // m.Index 是 hintIndex，帮助我们快速找到可接受的日志位置
+        // 如果 m.Index = 0，没有 hint，按传统回退
         if m.Index > 0 {
             pr.Next = m.Index
-        } else {
-            // 如果没提示，直接减1退回
-            if pr.Next > 1 {
-                pr.Next--
-            }
+        } else if pr.Next > 1 {
+            pr.Next--
         }
-        // 重新发送 Append 消息
         r.sendAppend(m.From)
         return
     }
 
-    // 不拒绝，说明成功追加日志
+    // 成功 append：m.Index 是 follower 最新的 Match Index
+    // 一定要保证只有在未 reject 时才更新
     pr.Match = m.Index
     pr.Next = pr.Match + 1
 
-    // 尝试推进 committed
+    // 更新 progress 后尝试推进 commit
     r.maybeCommit()
-
-    // // 如果正在做 Leader 转移，且对方已同步到最新日志
-    // if m.From == r.leadTransferee && pr.Match == r.RaftLog.LastIndex() {
+    // Leader transfer: 如果我们正试图把 leadership 移交给这个 follower
+    // if r.leadTransferee == m.From && pr.Match == r.RaftLog.LastIndex() {
     //     r.sendTimeoutNow(m.From)
     // }
 }
 
+
 func (r *Raft) maybeCommit() bool {
 	// 遍历所有 Progress，找到 matchIndex 的中位数
 	mci := r.RaftLog.maybeCommit(r.Prs, r.Term)
+	// log.Infof("[maybeCommit] trying to commit up to %d, current committed=%d", mci, r.RaftLog.committed)
 	if mci > r.RaftLog.committed {
 		r.RaftLog.commitTo(mci)
 		r.brocAppend()

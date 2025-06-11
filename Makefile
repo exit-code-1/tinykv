@@ -51,6 +51,10 @@ ci: default
 format:
 	@gofmt -s -w `find . -name '*.go' -type f ! -path '*/_tools/*' -print`
 
+certain_test:
+	$(TEST_CLEAN)
+	$(GOTEST) ./kv/test_raftstore -run ^TestPersistPartition2B$ || true
+
 project1:
 	$(GOTEST) ./kv/server -run 1
 

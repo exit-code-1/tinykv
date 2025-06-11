@@ -234,6 +234,9 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	if l.pendingSnapshot != nil && i == l.pendingSnapshot.Metadata.Index {
 		return l.pendingSnapshot.Metadata.Term, nil
 	}
+	if i == 0 {
+		return 0, nil // Raft 虚拟起点
+	}
 
 	entries, err := l.Entries(i, i+1)
 	if err == nil && len(entries) > 0 {

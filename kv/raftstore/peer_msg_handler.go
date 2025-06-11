@@ -9,7 +9,9 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
@@ -38,26 +40,160 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
-func (d *peerMsgHandler) HandleRaftReady() {
-	if d.stopped {
-		return
-	}
-	if d.RaftGroup.HasReady() {
-    ready := d.RaftGroup.Ready()
-    // ....
-    d.peerStorage.SaveReadyState(&ready)
-    // ...
-    d.Send(d.ctx.trans, ready.Messages)
+// if return true, d.proposals[0] is the target proposal
+func (d *peerMsgHandler) clearStaleAndGetTargetProposal(entry *eraftpb.Entry) bool {
+  d.clearStaleProposals(entry)
+  if len(d.proposals) > 0 && d.proposals[0].index == entry.Index {
+    p := d.proposals[0]
+    if p.term != entry.Term {
+      NotifyStaleReq(entry.Term, p.cb)
+      d.proposals = d.proposals[1:]
+      return false
+    } else {
+      return true
+    }
+  } else {
+    return false
+  }
+}
 
-    // ...
-    if len(ready.CommittedEntries) > 0 {
-      // applyEntries(.....)
+func (d *peerMsgHandler) clearStaleProposals(entry *eraftpb.Entry) {
+  var i int
+  for i = 0; i < len(d.proposals) && d.proposals[i].index < entry.Index; i++ {
+    d.proposals[i].cb.Done(ErrResp(&util.ErrStaleCommand{}))
+  }
+  d.proposals = d.proposals[i:]
+}
+
+
+func (d *peerMsgHandler) process(entry *eraftpb.Entry) {
+    // 1. 解码 entry.Data 为 RaftCmdRequest
+    var cmd raft_cmdpb.RaftCmdRequest
+    err := cmd.Unmarshal(entry.Data)
+    if err != nil {
+        panic(err)
     }
 
-    d.RaftGroup.Advance(ready)
-  	}
-	// Your Code Here (2B).
+    // 2. 响应结构初始化
+    resp := &raft_cmdpb.RaftCmdResponse{
+        Header:    &raft_cmdpb.RaftResponseHeader{},
+        Responses: []*raft_cmdpb.Response{},
+    }
+
+    // 3. 创建 WriteBatch 准备写入 KvDB
+    wb := &engine_util.WriteBatch{}
+
+    // 4. 检查 proposal 是否匹配（只有 leader 节点才有对应 proposal）
+    var p *proposal
+    matched := d.clearStaleAndGetTargetProposal(entry)
+    if matched {
+        p = d.proposals[0]
+    }
+
+    // 5. 遍历请求中的每个子请求
+    for _, req := range cmd.Requests {
+        switch req.CmdType {
+        case raft_cmdpb.CmdType_Put:
+            wb.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+            if matched {
+                resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+                    CmdType: raft_cmdpb.CmdType_Put,
+                    Put:     &raft_cmdpb.PutResponse{},
+                })
+            }
+
+        case raft_cmdpb.CmdType_Delete:
+            wb.DeleteCF(req.Delete.Cf, req.Delete.Key)
+            if matched {
+                resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+                    CmdType:  raft_cmdpb.CmdType_Delete,
+                    Delete:   &raft_cmdpb.DeleteResponse{},
+                })
+            }
+
+        case raft_cmdpb.CmdType_Get:
+            if matched {
+                val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+                if err != nil {
+                    panic(err)
+                }
+                resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+                    CmdType: raft_cmdpb.CmdType_Get,
+                    Get:     &raft_cmdpb.GetResponse{Value: val},
+                })
+            }
+
+        case raft_cmdpb.CmdType_Snap:
+            if matched {
+                resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+                    CmdType: raft_cmdpb.CmdType_Snap,
+                    Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+                })
+                // 注意设置 Txn，用于 snapshot 后续读取
+                p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+            }
+
+        default:
+            if matched {
+                resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+                    CmdType: raft_cmdpb.CmdType_Invalid,
+                })
+            }
+        }
+    }
+
+    // 6. 写入到 KvDB（Put/Delete 使用）
+    if len(cmd.Requests) > 0 &&
+        (cmd.Requests[0].CmdType == raft_cmdpb.CmdType_Put || cmd.Requests[0].CmdType == raft_cmdpb.CmdType_Delete) {
+        wb.WriteToDB(d.peerStorage.Engines.Kv)
+    }
+
+    // 7. 响应客户端（如果有匹配 proposal）
+    if matched && p != nil {
+        p.cb.Done(resp)
+        d.proposals = d.proposals[1:]
+    }
 }
+
+
+func (d *peerMsgHandler) HandleRaftReady() {
+    if d.stopped {
+        return
+    }
+
+    // 判断是否有新的 Ready 需要处理
+    if d.RaftGroup.HasReady() {
+        // 获取 Ready 对象，包含待持久化和待处理的数据
+        ready := d.RaftGroup.Ready()
+
+        // 将 Ready 中需要持久化的内容（如日志、快照等）保存到底层存储
+        if _, err := d.peerStorage.SaveReadyState(&ready); err != nil {
+            return
+        }
+
+        // 如果 Ready 中包含 snapshot，应用快照，更新本地状态
+        // if !d.IsEmptySnap(ready.Snapshot) {
+        //     if err := d.applySnapshot(ready.Snapshot); err != nil {
+        //         // 处理快照应用失败的情况，通常会停止 peer 或重试
+        //         return
+        //     }
+        // }
+
+        // 发送 Ready 中产生的 raft 消息给其他 peer
+        d.Send(d.ctx.trans, ready.Messages)
+
+        // 处理已提交但尚未应用的日志条目，更新状态机
+        for _, entry := range ready.CommittedEntries {
+			if entry.EntryType == eraftpb.EntryType_EntryNormal && len(entry.Data) > 0 {
+				d.process(&entry)
+			}
+		}
+
+        // 调用 Advance 推进 RawNode，表示已处理当前 Ready，准备下一轮
+        d.RaftGroup.Advance(ready)
+    }
+}
+
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 	switch msg.Type {
@@ -128,6 +264,23 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	proposal := &proposal{
+		index: d.nextProposalIndex(),
+		term:  d.Term(),
+		cb:    cb,
+	}
+	data, marErr := msg.Marshal()
+	if marErr != nil {
+		cb.Done(ErrResp(marErr))
+		return
+	}
+	perr := d.RaftGroup.Propose(data)
+	if perr != nil {
+		cb.Done(ErrResp(perr))
+		return
+	}
+
+	d.proposals = append(d.proposals, proposal)
 }
 
 func (d *peerMsgHandler) onTick() {
