@@ -94,6 +94,9 @@ func (l *RaftLog) EntriesFrom(index uint64) ([]pb.Entry, error) {
 }
 
 func (l *RaftLog) Entries(i, j uint64) ([]pb.Entry, error) {
+	if len(l.entries) == 0 {
+		return nil, nil // 没有日志，返回 ErrCompacted
+	}
     firstIndex := l.FirstIndex()
     lastIndex := l.LastIndex()
 
@@ -101,7 +104,7 @@ func (l *RaftLog) Entries(i, j uint64) ([]pb.Entry, error) {
     if i < firstIndex {
         return nil, ErrCompacted
     }
-    if j > lastIndex+1 {
+    if j > lastIndex + 1 {
         return nil, ErrUnavailable
     }
     if i > j {
@@ -189,7 +192,7 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
         return []pb.Entry{}
     }
     firstIndex := l.FirstIndex()
-    if l.stabled < firstIndex-1 {
+    if l.stabled < firstIndex {
         return append([]pb.Entry{}, l.entries...)
     }
     start := l.stabled - firstIndex + 1
@@ -200,52 +203,55 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 }
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() []pb.Entry {
+	if len(l.entries) == 0 {
+		return nil
+	}
 	firstIndex := l.FirstIndex()
 	if l.applied < l.committed {
-		return l.entries[l.applied+1-firstIndex : l.committed+1-firstIndex]
+		return l.entries[l.applied+1 -firstIndex : l.committed+1 -firstIndex]
 	}
 	return nil
 }
 
 func (l *RaftLog) FirstIndex() uint64 {
-	// 如果有 pendingSnapshot，firstIndex 是快照最后一条日志的索引+1
-	if l.pendingSnapshot != nil {
-		return l.pendingSnapshot.Metadata.Index + 1
-	}
 	if len(l.entries) > 0 {
 		return l.entries[0].Index
 	}
-	// 如果没有日志和快照，返回1或0视实现
-	return 1
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot.Metadata.Index 
+	}
+	// 如果没有日志和快照，返回0
+	firstindex, _ := l.storage.FirstIndex()
+	return firstindex-1
 }
 
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	if len(l.entries) == 0 {
-        return l.FirstIndex() - 1
+        return l.FirstIndex()
     }
     return l.entries[0].Index + uint64(len(l.entries)) - 1
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	// 1. 如果 snapshot 存在并且 i == snapshot.Metadata.Index，直接返回 snapshot 的 Term
-	if l.pendingSnapshot != nil && i == l.pendingSnapshot.Metadata.Index {
-		return l.pendingSnapshot.Metadata.Term, nil
+	if len(l.entries) > 0 && i >= l.FirstIndex() {
+		if i > l.LastIndex() {
+			return 0, ErrCompacted
+		}
+		return l.entries[i-l.FirstIndex()].Term, nil
+	} else {
+		if l.pendingSnapshot != nil {
+			if l.pendingSnapshot.Metadata.Index > i {
+				return 0, ErrCompacted
+			}
+			if l.pendingSnapshot.Metadata.Index == i {
+				return l.pendingSnapshot.Metadata.Term, nil
+			}
+			return l.pendingSnapshot.Metadata.Term, nil
+		}
+		term, err := l.storage.Term(i)
+		return term, err
 	}
-	if i == 0 {
-		return 0, nil // Raft 虚拟起点
-	}
-
-	entries, err := l.Entries(i, i+1)
-	if err == nil && len(entries) > 0 {
-		return entries[0].Term, nil
-	}
-	// 如果 entriesFrom 失败，尝试从 storage 获取 term
-	term, err := l.storage.Term(i)
-	if err != nil {
-		return 0, err
-	}
-	return term, nil
 }

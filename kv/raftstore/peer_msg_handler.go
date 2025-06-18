@@ -6,6 +6,7 @@ import (
 
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
@@ -65,54 +66,91 @@ func (d *peerMsgHandler) clearStaleProposals(entry *eraftpb.Entry) {
   d.proposals = d.proposals[i:]
 }
 
+func (d *peerMsgHandler) processAdminRequest(entry *eraftpb.Entry, cmd *raft_cmdpb.RaftCmdRequest) {
+	admin := cmd.AdminRequest
+	var p *proposal
+	matched := d.clearStaleAndGetTargetProposal(entry)
+	if matched {
+		p = d.proposals[0]
+	}
+	wb := &engine_util.WriteBatch{}
+	switch admin.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		cl := admin.CompactLog
+		applyState := d.peerStorage.applyState
+
+		// ✅ 更新 TruncatedState
+		applyState.TruncatedState.Index = cl.CompactIndex
+		applyState.TruncatedState.Term = cl.CompactTerm
+
+		wb.SetMeta(meta.ApplyStateKey(d.regionId), applyState)
+		wb.WriteToDB(d.peerStorage.Engines.Kv)
+		// ✅ 安排 GC 日志任务
+		d.ScheduleCompactLog(cl.CompactIndex)
+
+		// ✅ 响应 proposal
+		if matched && p != nil {
+			resp := &raft_cmdpb.RaftCmdResponse{
+				Header: &raft_cmdpb.RaftResponseHeader{},
+				Responses: []*raft_cmdpb.Response{
+					{CmdType: raft_cmdpb.CmdType(raft_cmdpb.AdminCmdType_CompactLog)},
+				},
+			}
+			p.cb.Done(resp)
+			d.proposals = d.proposals[1:]
+		}
+	}
+}
+
+
+
 
 func (d *peerMsgHandler) process(entry *eraftpb.Entry) {
     // 1. 解码 entry.Data 为 RaftCmdRequest
     var cmd raft_cmdpb.RaftCmdRequest
-    err := cmd.Unmarshal(entry.Data)
-    if err != nil {
+    if err := cmd.Unmarshal(entry.Data); err != nil {
         panic(err)
     }
 
-    // 2. 响应结构初始化
+    // 2. AdminRequest 走另一条逻辑（假设不涉及 Proposal 直接处理）
+    if cmd.AdminRequest != nil {
+        d.processAdminRequest(entry, &cmd)
+        return
+    }
+
+    // 3. 初始化响应结构
     resp := &raft_cmdpb.RaftCmdResponse{
         Header:    &raft_cmdpb.RaftResponseHeader{},
         Responses: []*raft_cmdpb.Response{},
     }
 
-    // 3. 创建 WriteBatch 准备写入 KvDB
+    // 4. 创建写批准备写入 KvDB
     wb := &engine_util.WriteBatch{}
 
-    // 4. 检查 proposal 是否匹配（只有 leader 节点才有对应 proposal）
-    var p *proposal
-    matched := d.clearStaleAndGetTargetProposal(entry)
-    if matched {
-        p = d.proposals[0]
-    }
+    // 5. Proposal 匹配和清理函数，返回匹配的 proposal（或 nil）
+    matchedProposal := d.matchProposal(entry)
 
-    // 5. 遍历请求中的每个子请求
+    // 6. 执行具体请求，写入 KvDB 并构造响应（只有命中 Proposal 才回复客户端）
     for _, req := range cmd.Requests {
         switch req.CmdType {
         case raft_cmdpb.CmdType_Put:
             wb.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
-            if matched {
+            if matchedProposal != nil {
                 resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
                     CmdType: raft_cmdpb.CmdType_Put,
                     Put:     &raft_cmdpb.PutResponse{},
                 })
             }
-
         case raft_cmdpb.CmdType_Delete:
             wb.DeleteCF(req.Delete.Cf, req.Delete.Key)
-            if matched {
+            if matchedProposal != nil {
                 resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
-                    CmdType:  raft_cmdpb.CmdType_Delete,
-                    Delete:   &raft_cmdpb.DeleteResponse{},
+                    CmdType: raft_cmdpb.CmdType_Delete,
+                    Delete:  &raft_cmdpb.DeleteResponse{},
                 })
             }
-
         case raft_cmdpb.CmdType_Get:
-            if matched {
+            if matchedProposal != nil {
                 val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
                 if err != nil {
                     panic(err)
@@ -122,19 +160,16 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry) {
                     Get:     &raft_cmdpb.GetResponse{Value: val},
                 })
             }
-
         case raft_cmdpb.CmdType_Snap:
-            if matched {
+            if matchedProposal != nil {
                 resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
                     CmdType: raft_cmdpb.CmdType_Snap,
                     Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
                 })
-                // 注意设置 Txn，用于 snapshot 后续读取
-                p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+                matchedProposal.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
             }
-
         default:
-            if matched {
+            if matchedProposal != nil {
                 resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
                     CmdType: raft_cmdpb.CmdType_Invalid,
                 })
@@ -142,17 +177,56 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry) {
         }
     }
 
-    // 6. 写入到 KvDB（Put/Delete 使用）
-    if len(cmd.Requests) > 0 &&
-        (cmd.Requests[0].CmdType == raft_cmdpb.CmdType_Put || cmd.Requests[0].CmdType == raft_cmdpb.CmdType_Delete) {
-        wb.WriteToDB(d.peerStorage.Engines.Kv)
-    }
+    // 7. 更新 applyIndex 并持久化
+    d.peerStorage.applyState.AppliedIndex = entry.Index
+    wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+    wb.WriteToDB(d.peerStorage.Engines.Kv)
 
-    // 7. 响应客户端（如果有匹配 proposal）
-    if matched && p != nil {
-        p.cb.Done(resp)
+    // 8. Proposal 命中时回调 Done 并移除
+    if matchedProposal != nil {
+        matchedProposal.cb.Done(resp)
         d.proposals = d.proposals[1:]
     }
+}
+
+// matchProposal 根据 entry 匹配 proposal，并清理过期 proposal
+func (d *peerMsgHandler) matchProposal(entry *eraftpb.Entry) *proposal {
+    for len(d.proposals) > 0 {
+        p := d.proposals[0]
+
+        if entry.Index < p.index {
+            // entry 还没到 proposal 这么前面的index，等后续entry
+            return nil
+        }
+
+        if entry.Index > p.index {
+            // proposal 过期，回调错误并移除
+            p.cb.Done(ErrRespStaleCommand(p.term))
+            d.proposals = d.proposals[1:]
+            continue
+        }
+
+        // entry.Index == p.index，判断 term
+        if entry.Term == p.term {
+            return p
+        }
+
+        if entry.Term < p.term {
+            // proposal 过期，回调错误并移除
+            p.cb.Done(ErrRespStaleCommand(p.term))
+            d.proposals = d.proposals[1:]
+            continue
+        }
+
+        if entry.Term > p.term {
+            // 乱序，回调错误并移除
+            p.cb.Done(ErrRespStaleCommand(p.term))
+            d.proposals = d.proposals[1:]
+            continue
+        }
+    }
+
+    return nil
 }
 
 
@@ -170,14 +244,6 @@ func (d *peerMsgHandler) HandleRaftReady() {
         if _, err := d.peerStorage.SaveReadyState(&ready); err != nil {
             return
         }
-
-        // 如果 Ready 中包含 snapshot，应用快照，更新本地状态
-        // if !d.IsEmptySnap(ready.Snapshot) {
-        //     if err := d.applySnapshot(ready.Snapshot); err != nil {
-        //         // 处理快照应用失败的情况，通常会停止 peer 或重试
-        //         return
-        //     }
-        // }
 
         // 发送 Ready 中产生的 raft 消息给其他 peer
         d.Send(d.ctx.trans, ready.Messages)

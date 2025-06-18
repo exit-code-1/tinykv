@@ -53,7 +53,7 @@ format:
 
 certain_test:
 	$(TEST_CLEAN)
-	$(GOTEST) ./kv/test_raftstore -run ^TestPersistPartition2B$ || true
+	$(GOTEST) ./kv/test_raftstore -run ^TestSnapshotUnreliableRecoverConcurrentPartition2C$ || true
 
 project1:
 	$(GOTEST) ./kv/server -run 1

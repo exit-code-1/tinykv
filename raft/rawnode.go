@@ -184,6 +184,9 @@ func (rn *RawNode) Ready() Ready {
 	if !isHardStateEqual(curHardSt, rn.prevHardSt) && !isHardStateEmpty(curHardSt) {
     	rd.HardState = curHardSt
 	}
+	if rn.Raft.RaftLog.pendingSnapshot != nil {
+		rd.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
+	}
 
 	// CommittedEntries：已提交、但尚未 apply 的日志
 	commitIndex := rn.Raft.RaftLog.committed
@@ -246,6 +249,10 @@ func (rn *RawNode) HasReady() bool {
 		return true
 	}
 
+	if r.RaftLog.pendingSnapshot != nil {
+		return true
+	}
+
 	// 检查是否有待发送消息
 	if len(r.msgs) > 0 {
 		return true
@@ -280,9 +287,9 @@ func (rn *RawNode) Advance(rd Ready) {
 	}
 
 	// 快照已处理（如果有）
-	// if !isEmptySnap(rd.Snapshot) {
-	// 	rn.Raft.RaftLog.pendingSnapshot = nil
-	// }
+	if rd.Snapshot.Metadata != nil {
+		rn.Raft.RaftLog.pendingSnapshot = nil
+	}
 }
 
 // GetProgress return the Progress of this node and its peers, if this

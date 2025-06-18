@@ -82,6 +82,9 @@ func (t *MockTransport) Send(msg *raft_serverpb.RaftMessage) error {
 	isSnapshot := msg.GetMessage().GetMsgType() == eraftpb.MessageType_MsgSnapshot
 	if isSnapshot {
 		snapshot := msg.Message.Snapshot
+		if snapshot == nil {
+			return nil
+		}
 		key, err := snap.SnapKeyFromSnap(snapshot)
 		if err != nil {
 			return err

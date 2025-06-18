@@ -253,8 +253,13 @@ func (r *Raft) sendAppend(to uint64) bool {
 	nextIndex := pr.Next
 	prevIndex := nextIndex - 1
 	prevTerm, err := r.RaftLog.Term(prevIndex)
+
 	if err != nil {
-		// panic
+		if err == ErrCompacted {
+			r.sendSnapshot(to)
+			return true
+		}
+		return false
 	}
 
 	entries, _ := r.RaftLog.EntriesFrom(nextIndex)
@@ -272,6 +277,26 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 	r.send(m)
 	return true
+}
+
+func (r *Raft) sendSnapshot(to uint64) {
+    snapshot, err := r.RaftLog.storage.Snapshot()
+    if err != nil || snapshot.Metadata == nil {
+        // 快照还未准备好（可能刚触发 GC，还未生成快照）
+        return
+    }
+
+    msg := pb.Message{
+        MsgType: pb.MessageType_MsgSnapshot,
+        To:      to,
+        From:    r.id,
+        Term:    r.Term,
+        Snapshot: &snapshot,
+    }
+
+    r.send(msg)
+	// avoid snapshot is sent too frequently
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
 }
 
 
@@ -436,8 +461,6 @@ func (r *Raft) append_or_rewriteEntry(prevLogIndex uint64, entries []*pb.Entry) 
 }
 
 func (r *Raft) send(m pb.Message) {
-	// 注意设置 From 字段
-	m.From = r.id
 	r.msgs = append(r.msgs, m)
 }
 
@@ -556,7 +579,7 @@ func (r *Raft) Step(m pb.Message) error {
 		r.handleSnapshot(m)
 
 	case pb.MessageType_MsgTransferLeader:
-		// r.handleTransferLeader(m)
+		r.handleTransferLeader(m)
 
 	case pb.MessageType_MsgTimeoutNow:
 		// r.hup()
@@ -655,7 +678,7 @@ func (r *Raft) handleVoteResp(m pb.Message) {
 // 返回 ok 表示是否匹配，冲突 term 和 index 可用于快速回退。
 func (r *Raft) checkLogMatching(index, term uint64) (bool, uint64, uint64) {
 	lastIndex := r.RaftLog.LastIndex()
-
+	// 如果 index < snapshot，日志已经被压缩，不可能匹配
 	// 日志太短，直接失败
 	if index > lastIndex {
 		return false, lastIndex + 1, 0
@@ -669,7 +692,7 @@ func (r *Raft) checkLogMatching(index, term uint64) (bool, uint64, uint64) {
 	}
 
 	// term 不匹配，返回冲突信息
-	if localTerm != term {
+	if localTerm != term && localTerm != 0 {
 		conflictTerm := localTerm
 		conflictIndex := r.RaftLog.findFirstIndexOfTerm(conflictTerm)
 		return false, conflictIndex, conflictTerm
@@ -870,10 +893,93 @@ func (r *Raft) maybeCommit() bool {
 }
 
 
-// handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
-	// Your Code Here (2C).
+	snapshot := m.Snapshot
+	if snapshot == nil || snapshot.Metadata == nil {
+		return
+	}
+
+	snapshotIndex := snapshot.Metadata.Index
+	snapshotTerm := snapshot.Metadata.Term
+
+	if r.RaftLog.committed >= snapshotIndex {
+		return
+	}
+
+	// 转为 follower
+	r.becomeFollower(snapshotTerm, m.From)
+
+	// 应用 snapshot
+	r.RaftLog.pendingSnapshot = snapshot
+	r.RaftLog.committed = snapshotIndex
+	r.RaftLog.applied = snapshotIndex
+	r.RaftLog.stabled = snapshotIndex
+	r.RaftLog.entries = nil
+
+	r.Prs = make(map[uint64]*Progress)
+	for _, id := range snapshot.Metadata.ConfState.Nodes {
+		r.Prs[id] = &Progress{}
+	}
+
+	// 设置自己 Match 和 Next
+	if pr, ok := r.Prs[r.id]; ok {
+		pr.Match = snapshotIndex
+		pr.Next = snapshotIndex + 1
+	}
+
+	// 响应 Leader
+	resp := pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		To:      m.From,
+		From:    r.id,
+		Term:    r.Term,
+		Index:   snapshotIndex,
+		Reject:  false,
+	}
+	r.send(resp)
 }
+
+func (r *Raft) handleTransferLeader(m pb.Message) {
+	// 1. 如果目标节点不在当前集群中，直接返回
+	if _, ok := r.Prs[m.From]; !ok {
+		return
+	}
+
+	// 2. 如果当前节点不是 Leader，转发给 Leader 并返回
+	if r.State != StateLeader {
+		if r.Lead != None {
+			m.To = r.Lead
+			r.send(m)
+		}
+		return
+	}
+
+	// 3. 如果目标是自己，忽略
+	if m.From == r.id {
+		return
+	}
+
+	// 4. 设置 leadTransferee
+	r.leadTransferee = m.From
+
+	pr := r.Prs[m.From]
+
+	// 5. 如果目标节点日志不是最新，发送 AppendEntries
+	if pr.Match != r.RaftLog.LastIndex() {
+		r.sendAppend(m.From)
+		return
+	}
+
+	// 6. 如果日志是最新，发送 MsgTimeoutNow，让它立即发起选举
+	r.send(pb.Message{
+		To:      m.From,
+		MsgType: pb.MessageType_MsgTimeoutNow,
+	})
+
+	// 7. 清除 leadTransferee
+	r.leadTransferee = None
+}
+
 
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {

@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # settings to change
-times=5
-project="2b"
+times=4
+project="2c"
 removelog=1
 
 # don't change
