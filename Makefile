@@ -53,7 +53,8 @@ format:
 
 certain_test:
 	$(TEST_CLEAN)
-	$(GOTEST) ./kv/test_raftstore -run ^TestSnapshotUnreliableRecoverConcurrentPartition2C$ || true
+	$(GOTEST) ./kv/test_raftstore -run ^TestSplitRecoverManyClients3B$ || true
+	$(TEST_CLEAN)
 
 project1:
 	$(GOTEST) ./kv/server -run 1
@@ -87,6 +88,7 @@ project2b:
 	$(GOTEST) ./kv/test_raftstore -run ^TestPersistPartitionUnreliable2B$ || true
 	$(TEST_CLEAN)
 
+
 project2c:
 	$(TEST_CLEAN)
 	$(GOTEST) ./raft -run 2C || true
@@ -114,6 +116,17 @@ project3b:
 	$(GOTEST) ./kv/test_raftstore -run ^TestConfChangeUnreliableRecover3B$ || true
 	$(GOTEST) ./kv/test_raftstore -run ^TestConfChangeSnapshotUnreliableRecover3B$ || true
 	$(GOTEST) ./kv/test_raftstore -run ^TestConfChangeSnapshotUnreliableRecoverConcurrentPartition3B$ || true
+	$(GOTEST) ./kv/test_raftstore -run ^TestOneSplit3B$ || true
+	$(GOTEST) ./kv/test_raftstore -run ^TestSplitRecover3B$ || true
+	$(GOTEST) ./kv/test_raftstore -run ^TestSplitRecoverManyClients3B$ || true
+	$(GOTEST) ./kv/test_raftstore -run ^TestSplitUnreliable3B$ || true
+	$(GOTEST) ./kv/test_raftstore -run ^TestSplitUnreliableRecover3B$ || true
+	$(GOTEST) ./kv/test_raftstore -run ^TestSplitConfChangeSnapshotUnreliableRecover3B$ || true
+	$(GOTEST) ./kv/test_raftstore -run ^TestSplitConfChangeSnapshotUnreliableRecoverConcurrentPartition3B$ || true
+	$(TEST_CLEAN)
+
+project3bc:
+	$(TEST_CLEAN)
 	$(GOTEST) ./kv/test_raftstore -run ^TestOneSplit3B$ || true
 	$(GOTEST) ./kv/test_raftstore -run ^TestSplitRecover3B$ || true
 	$(GOTEST) ./kv/test_raftstore -run ^TestSplitRecoverManyClients3B$ || true

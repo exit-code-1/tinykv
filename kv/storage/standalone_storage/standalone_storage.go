@@ -1,25 +1,24 @@
 package standalone_storage
 
 import (
-	"path/filepath"
 	"github.com/Connor1996/badger"
 	"github.com/pingcap-incubator/tinykv/kv/config"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
+	"path/filepath"
 )
 
 // StandAloneStorage is an implementation of `Storage` for a single-node TinyKV instance. It does not
 // communicate with other nodes and all data is stored locally.
 type StandAloneStorage struct {
-	conf   *config.Config
+	conf      *config.Config
 	badger_db *badger.DB
 }
 
 type StandAloneStorageReader struct {
 	txn *badger.Txn
 }
-
 
 func NewStandAloneStorage(conf *config.Config) *StandAloneStorage {
 	return &StandAloneStorage{

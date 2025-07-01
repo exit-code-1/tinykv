@@ -18,6 +18,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/operator"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/opt"
+	"sort"
 )
 
 func init() {
@@ -76,7 +77,91 @@ func (s *balanceRegionScheduler) IsScheduleAllowed(cluster opt.Cluster) bool {
 }
 
 func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operator {
-	// Your Code Here (3C).
+	// 1. 获取所有可用的 store，并按 region size 降序排列
+	stores := cluster.GetStores()
+	var candidates []*core.StoreInfo
+	for _, store := range stores {
+		if store.IsUp() && store.DownTime() < cluster.GetMaxStoreDownTime() {
+			candidates = append(candidates, store)
+		}
+	}
+	if len(candidates) < 2 {
+		return nil
+	}
 
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].GetRegionSize() > candidates[j].GetRegionSize()
+	})
+
+	// 2. 尝试从 region size 最大的 store 迁移 region
+	for i := len(candidates) - 1; i >= 0; i-- { // 从大到小遍历
+		srcStore := candidates[i]
+
+		var region *core.RegionInfo
+		// 1. 优先选择 pending region
+		cluster.GetPendingRegionsWithLock(srcStore.GetID(), func(container core.RegionsContainer) {
+			region = container.RandomRegion(nil, nil)
+		})
+
+		// 2. 其次选择 follower region（如果没找到）
+		if region == nil {
+			cluster.GetFollowersWithLock(srcStore.GetID(), func(container core.RegionsContainer) {
+				region = container.RandomRegion(nil, nil)
+			})
+		}
+
+		// 3. 最后选择 leader region（如果没找到）
+		if region == nil {
+			cluster.GetLeadersWithLock(srcStore.GetID(), func(container core.RegionsContainer) {
+				region = container.RandomRegion(nil, nil)
+			})
+		}
+
+		// 3. 选择目标 store（region size 最小的 store，且不能是自己，且不能已存在 peer）
+		var dstStore *core.StoreInfo
+		for _, store := range candidates {
+			if store.GetID() == srcStore.GetID() {
+				continue
+			}
+			if region.GetStorePeer(store.GetID()) != nil {
+				continue
+			}
+			dstStore = store
+			break
+		}
+		if dstStore == nil {
+			continue
+		}
+
+		// 4. 判断是否值得迁移
+		srcSize := srcStore.GetRegionSize()
+		dstSize := dstStore.GetRegionSize()
+		regionSize := region.GetApproximateSize()
+		if regionSize == 0 {
+			regionSize = 1 // 防止除零
+		}
+		if srcSize-dstSize < 2*regionSize {
+			continue
+		}
+
+		// 5. 创建迁移操作
+		newPeer, err := cluster.AllocPeer(dstStore.GetID())
+		if err != nil {
+			continue
+		}
+		op, err := operator.CreateMovePeerOperator(
+			"balance-region",
+			cluster,
+			region,
+			operator.OpBalance,
+			srcStore.GetID(),
+			newPeer.GetStoreId(),
+			newPeer.GetId(),
+		)
+		if err != nil {
+			continue
+		}
+		return op
+	}
 	return nil
 }

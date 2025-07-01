@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # settings to change
-times=4
-project="2c"
+times=5
+project="3b"
 removelog=1
 
 # don't change
@@ -35,7 +35,7 @@ do
     end=$(date +%s)
     pass_count=$(grep -i "PASS" $logfile | wc -l)
     echo "pass count: $pass_count"
-    fail_count=$(grep -i "fail" $logfile | wc -l)
+    fail_count=$(grep -i "FAIL" $logfile | wc -l)
     echo "fail count: $fail_count"
     panic_count=$(grep -i "panic" $logfile | wc -l)
     echo "panic count: $panic_count"

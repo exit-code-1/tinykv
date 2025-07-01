@@ -278,8 +278,39 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
-	// Your Code Here (3C).
+	c.Lock()
+	defer c.Unlock()
 
+	origin := c.core.GetRegion(region.GetID())
+	originEpoch := origin.GetRegionEpoch()
+	regionEpoch := region.GetRegionEpoch()
+	// 1. 如果本地有该 region，比较 epoch
+	if origin != nil {
+		if regionEpoch.GetVersion() < originEpoch.GetVersion() ||
+			(regionEpoch.GetVersion() == originEpoch.GetVersion() && regionEpoch.GetConfVer() < originEpoch.GetConfVer()) {
+			// 过时心跳，丢弃
+			return nil
+		}
+	}
+
+	// 2. 如果本地没有，检查是否与其他 region 重叠
+	if origin == nil {
+		regions := c.ScanRegions(region.GetStartKey(), region.GetEndKey(), -1)
+		for _, item := range regions {
+			overlapEpoch := item.GetRegionEpoch()
+			if regionEpoch.GetVersion() < overlapEpoch.GetVersion() ||
+				(regionEpoch.GetVersion() == overlapEpoch.GetVersion() && regionEpoch.GetConfVer() < overlapEpoch.GetConfVer()) {
+				// 有重叠且 epoch 更小，丢弃
+				return nil
+			}
+		}
+	}
+
+	c.putRegion(region)
+	storeids := region.GetStoreIds()
+	for id := range storeids {
+		c.updateStoreStatusLocked(id)
+	}
 	return nil
 }
 

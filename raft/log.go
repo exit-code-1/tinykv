@@ -23,9 +23,9 @@ import (
 
 // RaftLog manage the log entries, its struct look like:
 //
-//  snapshot/first.....applied....committed....stabled.....last
-//  --------|------------------------------------------------|
-//                            log entries
+//	snapshot/first.....applied....committed....stabled.....last
+//	--------|------------------------------------------------|
+//	                          log entries
 //
 // for simplify the RaftLog implement should manage all log entries
 // that not truncated
@@ -53,7 +53,6 @@ type RaftLog struct {
 	// the incoming unstable snapshot, if any.
 	// (Used in 2C)
 	pendingSnapshot *pb.Snapshot
-
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -79,12 +78,12 @@ func newLog(storage Storage) *RaftLog {
 	}
 
 	return &RaftLog{
-		storage:          storage,
-		entries:          entries,
-		committed:        hardState.Commit,
-		applied:          firstIndex - 1,
-		stabled:          lastIndex,
-		pendingSnapshot:  nil,
+		storage:         storage,
+		entries:         entries,
+		committed:       hardState.Commit,
+		applied:         firstIndex - 1,
+		stabled:         lastIndex,
+		pendingSnapshot: nil,
 	}
 }
 
@@ -97,44 +96,42 @@ func (l *RaftLog) Entries(i, j uint64) ([]pb.Entry, error) {
 	if len(l.entries) == 0 {
 		return nil, nil // 没有日志，返回 ErrCompacted
 	}
-    firstIndex := l.FirstIndex()
-    lastIndex := l.LastIndex()
+	firstIndex := l.FirstIndex()
+	lastIndex := l.LastIndex()
 
-    // 边界检查
-    if i < firstIndex {
-        return nil, ErrCompacted
-    }
-    if j > lastIndex + 1 {
-        return nil, ErrUnavailable
-    }
-    if i > j {
-        return nil, nil // 空区间合法，返回空 slice
-    }
+	// 边界检查
+	if i < firstIndex {
+		return nil, ErrCompacted
+	}
+	if j > lastIndex+1 {
+		return nil, ErrUnavailable
+	}
+	if i > j {
+		return nil, nil // 空区间合法，返回空 slice
+	}
 
-    offsetStart := i - firstIndex
-    offsetEnd := j - firstIndex
+	offsetStart := i - firstIndex
+	offsetEnd := j - firstIndex
 
-    return l.entries[offsetStart:offsetEnd], nil
+	return l.entries[offsetStart:offsetEnd], nil
 }
-
 
 func entriesToPointers(entries []pb.Entry) []*pb.Entry {
-    res := make([]*pb.Entry, len(entries))
-    for i := range entries {
-        res[i] = &entries[i]
-    }
-    return res
+	res := make([]*pb.Entry, len(entries))
+	for i := range entries {
+		res[i] = &entries[i]
+	}
+	return res
 }
 
-
 func (l *RaftLog) appliedTo(i uint64) {
-  if i == 0 {
-    return
-  }
-  if l.committed < i || i < l.applied {
-    log.Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed)
-  }
-  l.applied = i
+	if i == 0 {
+		return
+	}
+	if l.committed < i || i < l.applied {
+		log.Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed)
+	}
+	l.applied = i
 }
 
 func (l *RaftLog) maybeCommit(prs map[uint64]*Progress, term uint64) uint64 {
@@ -188,19 +185,20 @@ func (l *RaftLog) allEntries() []pb.Entry {
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-    if len(l.entries) == 0 {
-        return []pb.Entry{}
-    }
-    firstIndex := l.FirstIndex()
-    if l.stabled < firstIndex {
-        return append([]pb.Entry{}, l.entries...)
-    }
-    start := l.stabled - firstIndex + 1
-    if start >= uint64(len(l.entries)) {
-        return []pb.Entry{}
-    }
-    return append([]pb.Entry{}, l.entries[start:]...)
+	if len(l.entries) == 0 {
+		return []pb.Entry{}
+	}
+	firstIndex := l.FirstIndex()
+	if l.stabled < firstIndex {
+		return append([]pb.Entry{}, l.entries...)
+	}
+	start := l.stabled - firstIndex + 1
+	if start >= uint64(len(l.entries)) {
+		return []pb.Entry{}
+	}
+	return append([]pb.Entry{}, l.entries[start:]...)
 }
+
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() []pb.Entry {
 	if len(l.entries) == 0 {
@@ -208,7 +206,7 @@ func (l *RaftLog) nextEnts() []pb.Entry {
 	}
 	firstIndex := l.FirstIndex()
 	if l.applied < l.committed {
-		return l.entries[l.applied+1 -firstIndex : l.committed+1 -firstIndex]
+		return l.entries[l.applied+1-firstIndex : l.committed+1-firstIndex]
 	}
 	return nil
 }
@@ -218,20 +216,19 @@ func (l *RaftLog) FirstIndex() uint64 {
 		return l.entries[0].Index
 	}
 	if l.pendingSnapshot != nil {
-		return l.pendingSnapshot.Metadata.Index 
+		return l.pendingSnapshot.Metadata.Index
 	}
 	// 如果没有日志和快照，返回0
 	firstindex, _ := l.storage.FirstIndex()
-	return firstindex-1
+	return firstindex - 1
 }
-
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	if len(l.entries) == 0 {
-        return l.FirstIndex()
-    }
-    return l.entries[0].Index + uint64(len(l.entries)) - 1
+		return l.FirstIndex()
+	}
+	return l.entries[0].Index + uint64(len(l.entries)) - 1
 }
 
 // Term return the term of the entry in the given index

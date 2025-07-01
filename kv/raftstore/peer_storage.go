@@ -308,39 +308,38 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
-    // Step 1: 没有条目则直接返回
-    if len(entries) == 0 {
-        return nil
-    }
+	// Step 1: 没有条目则直接返回
+	if len(entries) == 0 {
+		return nil
+	}
 
-    // Step 2: 获取当前将要持久化的最大 index
-    stableLast := entries[len(entries)-1].Index
+	// Step 2: 获取当前将要持久化的最大 index
+	stableLast := entries[len(entries)-1].Index
 
-    // Step 3: 获取之前持久化的最大 index（也可以用 ps.raftState.LastIndex，但这里更保险）
-    prevLast, err := ps.LastIndex()
-    if err != nil {
-        return err
-    }
+	// Step 3: 获取之前持久化的最大 index（也可以用 ps.raftState.LastIndex，但这里更保险）
+	prevLast, err := ps.LastIndex()
+	if err != nil {
+		return err
+	}
 
-    // Step 4: 更新 raftState 的 LastIndex 和 LastTerm
-    ps.raftState.LastIndex = stableLast
-    ps.raftState.LastTerm = entries[len(entries)-1].Term
+	// Step 4: 更新 raftState 的 LastIndex 和 LastTerm
+	ps.raftState.LastIndex = stableLast
+	ps.raftState.LastTerm = entries[len(entries)-1].Term
 
-    // Step 5: 追加新的日志条目
-    for _, ent := range entries {
-        key:= meta.RaftLogKey(ps.region.Id, ent.Index)
-        raftWB.SetMeta(key, &ent)
-    }
+	// Step 5: 追加新的日志条目
+	for _, ent := range entries {
+		key := meta.RaftLogKey(ps.region.Id, ent.Index)
+		raftWB.SetMeta(key, &ent)
+	}
 
-    // Step 6: 删除被截断的日志（这些日志永远不会被提交）
-    for i := stableLast + 1; i <= prevLast; i++ {
-        key := meta.RaftLogKey(ps.region.Id, i)
-        raftWB.DeleteMeta(key)
-    }
+	// Step 6: 删除被截断的日志（这些日志永远不会被提交）
+	for i := stableLast + 1; i <= prevLast; i++ {
+		key := meta.RaftLogKey(ps.region.Id, i)
+		raftWB.DeleteMeta(key)
+	}
 
-    return nil
+	return nil
 }
-
 
 // Apply the peer with given snapshot
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
@@ -362,12 +361,12 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// Your Code Here (2C).
 	snapRegion := snapData.Region
 
-	// 2. 清理旧的 raft 和 kv 数据（包括 raft log、region 元信息等）
-	if err := ps.clearMeta(kvWB, raftWB); err != nil {
-		return nil, err
+	if ps.isInitialized() {
+		if err := ps.clearMeta(kvWB, raftWB); err != nil {
+			return nil, err
+		}
+		ps.clearExtraData(snapRegion)
 	}
-
-	ps.clearExtraData(snapRegion)
 
 	// 3. 更新 raftState（内存）: LastIndex、LastTerm
 	ps.raftState.LastIndex = snapshot.Metadata.Index
@@ -383,7 +382,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 
 	// 5. 更新 snapState（内存）：表示 snapshot 正在被 apply
 	ps.snapState.StateType = snap.SnapState_Applying
-	
+
 	// 6. 通知 region_worker 执行 RegionTaskApply，实际应用 snapshot 中的 kv 数据
 	ch := make(chan bool, 1)
 	ps.regionSched <- &runner.RegionTaskApply{
@@ -402,8 +401,6 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// 8. 持久化 RegionLocalState 到 kv engine 的 meta 区
 	meta.WriteRegionState(kvWB, snapRegion, rspb.PeerState_Normal)
 
-	kvWB.WriteToDB(ps.Engines.Kv)
-	raftWB.WriteToDB(ps.Engines.Raft)
 	// 9. 返回 ApplySnapResult，用于后续处理
 	return &ApplySnapResult{
 		PrevRegion: prevRegion,
@@ -414,39 +411,36 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 // Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
-    kvWB := &engine_util.WriteBatch{}
-    raftWB := &engine_util.WriteBatch{}
+	kvWB := &engine_util.WriteBatch{}
+	raftWB := &engine_util.WriteBatch{}
 
-    var applySnapResult *ApplySnapResult
-    var err error
+	var applySnapResult *ApplySnapResult
+	var err error
 
-    // 1. 如果有 snapshot，先应用快照
-    if !raft.IsEmptySnap(&ready.Snapshot) {
-        applySnapResult, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
-        if err != nil {
-            return nil, err
-        }
-		kvWB.Reset()
-		raftWB.Reset()
-    }
+	// 1. 如果有 snapshot，先应用快照
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		applySnapResult, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		if err != nil {
+			return nil, err
+		}
+	}
 
-    // 2. 追加日志条目
-    if len(ready.Entries) > 0 {
-        ps.Append(ready.Entries, raftWB)
-    }
+	// 2. 追加日志条目
+	if len(ready.Entries) > 0 {
+		ps.Append(ready.Entries, raftWB)
+	}
 
-    // 3. 更新 HardState 并保存
-    if !raft.IsEmptyHardState(ready.HardState) {
-        ps.raftState.HardState = &ready.HardState
-    }
-    raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
-    // 4. 写入 RocksDB
+	// 3. 更新 HardState 并保存
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+	}
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	// 4. 写入 RocksDB
 	kvWB.WriteToDB(ps.Engines.Kv)
 	raftWB.WriteToDB(ps.Engines.Raft)
 
-    return applySnapResult, nil
+	return applySnapResult, nil
 }
-
 
 func (ps *PeerStorage) ClearData() {
 	ps.clearRange(ps.region.GetId(), ps.region.GetStartKey(), ps.region.GetEndKey())

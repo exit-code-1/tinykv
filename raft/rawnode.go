@@ -68,10 +68,10 @@ type Ready struct {
 
 // RawNode is a wrapper of Raft.
 type RawNode struct {
-	Raft               *Raft
+	Raft *Raft
 	// Mutable fields.
-	prevSoftSt     *SoftState
-	prevHardSt     pb.HardState
+	prevSoftSt *SoftState
+	prevHardSt pb.HardState
 	// stepsOnAdvance []pb.Message
 }
 
@@ -81,7 +81,7 @@ func (a *SoftState) equal(b *SoftState) bool {
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
-    r := newRaft(config) // 你自己的 Raft 构造函数
+	r := newRaft(config) // 你自己的 Raft 构造函数
 	softstate := &SoftState{
 		Lead:      r.Lead,
 		RaftState: r.State,
@@ -91,12 +91,12 @@ func NewRawNode(config *Config) (*RawNode, error) {
 		Vote:   r.Vote,
 		Commit: r.RaftLog.committed,
 	}
-    rn := &RawNode{
-        Raft:       r,
+	rn := &RawNode{
+		Raft:       r,
 		prevSoftSt: softstate,
 		prevHardSt: hardstate,
-    }
-    return rn, nil
+	}
+	return rn, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -164,7 +164,7 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	rd := Ready{
-		Entries: 		rn.Raft.RaftLog.unstableEntries(),
+		Entries: rn.Raft.RaftLog.unstableEntries(),
 	}
 
 	// 软状态（Leader ID、当前状态）变化
@@ -182,7 +182,7 @@ func (rn *RawNode) Ready() Ready {
 		Commit: rn.Raft.RaftLog.committed,
 	}
 	if !isHardStateEqual(curHardSt, rn.prevHardSt) && !isHardStateEmpty(curHardSt) {
-    	rd.HardState = curHardSt
+		rd.HardState = curHardSt
 	}
 	if rn.Raft.RaftLog.pendingSnapshot != nil {
 		rd.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
@@ -209,7 +209,7 @@ func (rn *RawNode) Ready() Ready {
 }
 
 func isHardStateEmpty(st pb.HardState) bool {
-    return st.Term == 0 && st.Vote == 0 && st.Commit == 0
+	return st.Term == 0 && st.Vote == 0 && st.Commit == 0
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
@@ -271,7 +271,7 @@ func (rn *RawNode) Advance(rd Ready) {
 	}
 
 	if !isHardStateEqual(rd.HardState, rn.prevHardSt) && !isHardStateEmpty(rd.HardState) {
-    	rn.prevHardSt = rd.HardState
+		rn.prevHardSt = rd.HardState
 	}
 
 	// 丢弃已经保存到稳定存储的 entries

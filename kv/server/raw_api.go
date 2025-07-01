@@ -45,11 +45,11 @@ func (server *Server) RawPut(_ context.Context, req *kvrpcpb.RawPutRequest) (*kv
 		Data: put,
 	}
 	err := server.storage.Write(req.GetContext(), []storage.Modify{modify})
-    resp := &kvrpcpb.RawPutResponse{}
-    if err != nil {
-        resp.Error = err.Error()
-    }
-    return resp, err
+	resp := &kvrpcpb.RawPutResponse{}
+	if err != nil {
+		resp.Error = err.Error()
+	}
+	return resp, err
 }
 
 // RawDelete delete the target data from storage and returns the corresponding response
@@ -57,18 +57,18 @@ func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest
 	// Your Code Here (1).
 	// Hint: Consider using Storage.Modify to store data to be deleted
 	delete := storage.Delete{
-		Key:   req.GetKey(),
-		Cf:    req.GetCf(),
+		Key: req.GetKey(),
+		Cf:  req.GetCf(),
 	}
 	modify := storage.Modify{
 		Data: delete,
 	}
 	err := server.storage.Write(req.GetContext(), []storage.Modify{modify})
-    resp := &kvrpcpb.RawDeleteResponse{}
-    if err != nil {
-        resp.Error = err.Error()
-    }
-    return resp, err
+	resp := &kvrpcpb.RawDeleteResponse{}
+	if err != nil {
+		resp.Error = err.Error()
+	}
+	return resp, err
 }
 
 // RawScan scan the data starting from the start key up to limit. and return the corresponding result
@@ -89,7 +89,7 @@ func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*
 		}
 		item := iter.Item()
 		val, key_err := item.ValueCopy(nil)
-		if(key_err != nil) {
+		if key_err != nil {
 			err = key_err
 			break
 		}
@@ -105,4 +105,3 @@ func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*
 	}
 	return resp, err
 }
-
